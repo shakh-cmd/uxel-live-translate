@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Tourmania" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#0B2D6B</item>
+        <item name="android:navigationBarColor">#0B2D6B</item>
+        <item name="android:windowBackground">#EEF3FB</item>
+    </style>
+</resources>

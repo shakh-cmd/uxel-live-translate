@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: tourmania-live-translate
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRANSLATION_PROVIDER
+        value: mock
+      - key: GUIDE_PIN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: STORE_AUDIO
+        value: "false"
+      - key: MAX_GUESTS
+        value: "6"

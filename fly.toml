@@ -1,0 +1,24 @@
+# Replace the app name, then: fly launch --no-deploy && fly deploy
+# WebSockets need a machine that stays up for the whole tour.
+app = "tourmania-live-translate"
+primary_region = "fra"
+
+[build]
+
+[env]
+  PORT = "4317"
+  HOST = "0.0.0.0"
+  TRANSLATION_PROVIDER = "mock"
+
+[http_service]
+  internal_port = 4317
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/api/health"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"

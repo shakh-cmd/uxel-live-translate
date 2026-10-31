@@ -1,0 +1,8 @@
+node_modules
+dist
+data
+.git
+android
+tests/e2e
+*.md
+!README.md
