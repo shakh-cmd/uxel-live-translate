@@ -10,7 +10,7 @@ import type { AudioResult, LanguageStream, ProviderContext, StreamHandlers, Supp
 const LIVE_NOTE =
   "Gemini 3.5 Live Translate (speech to speech). Verified against the Live Translate guide, 31 Oct 2026. Not executed in this build without GEMINI_API_KEY.";
 const SCRIPT_NOTE =
-  "Script text is translated with gemini-2.5-flash. Live Translate does not accept text, so the stop's spoken audio is local espeak-ng.";
+  "Script text is translated with the GEMINI_TEXT_MODEL (default gemini-3.5-flash-lite). Live Translate does not accept text, so the stop's spoken audio is local espeak-ng.";
 
 export function buildGeminiSetup(opts: { model: string; targetLanguageCode: string; glossary: string[] }) {
   return {
@@ -111,7 +111,7 @@ export class GeminiProvider implements TranslationProvider {
         charactersIn: 0,
         charactersOut: text.length,
         estimatedUsd: geminiTextUsd(prompt.length, text.length),
-        note: "Question audio via gemini-2.5-flash generateContent. Text-token estimate only.",
+        note: "Question audio via GEMINI_TEXT_MODEL generateContent. Text-token estimate only.",
       },
     };
   }
@@ -173,7 +173,7 @@ export class GeminiProvider implements TranslationProvider {
         charactersIn: source.length,
         charactersOut: text.length,
         estimatedUsd: geminiTextUsd(prompt.length, text.length),
-        note: "gemini-2.5-flash text tokens estimated at 4 characters per token.",
+        note: "Gemini text-model tokens estimated at 4 characters per token.",
       },
     };
   }
@@ -195,14 +195,49 @@ export class GeminiProvider implements TranslationProvider {
   }
 }
 
+/**
+ * Live Translate only moves its output clock forward while it receives input audio.
+ * The guide app gates the mic with a VAD, so during pauses Gemini got nothing, the
+ * translation (usually longer than the English) fell further behind every sentence and
+ * the last sentence stayed stuck until the guide spoke again. We keep the stream fed with
+ * real-time silence after speech, while Gemini is still talking, so it can catch up.
+ */
+export const SILENCE_FRAME_MS = 100;
+
+export type PadState = {
+  now: number;
+  lastRealAt: number;
+  lastVoiceOutAt: number;
+  minMs: number;
+  maxMs: number;
+};
+
+export function shouldPadSilence(state: PadState): boolean {
+  if (!state.lastRealAt) return false;
+  const sinceReal = state.now - state.lastRealAt;
+  if (sinceReal < SILENCE_FRAME_MS + 20) return false; // real audio is still flowing
+  if (sinceReal >= state.maxMs) return false;
+  if (sinceReal < state.minMs) return true;
+  // Keep going while Gemini is still producing translated speech.
+  return state.now - state.lastVoiceOutAt < 1500;
+}
+
 class GeminiLanguageStream implements LanguageStream {
   private socket: WebSocket | null = null;
   private ready = false;
   private closed = false;
   private queue: Buffer[] = [];
   private inputBytes = 0;
+  private padBytes = 0;
   private caption = { source: "", translation: "" };
   private speaking = false;
+  private lastRealAt = 0;
+  private lastVoiceOutAt = 0;
+  private lastPadAt = 0;
+  private endPending = false;
+  private padTimer: NodeJS.Timeout | null = null;
+  private padMinMs: number;
+  private padMaxMs: number;
 
   constructor(
     config: Config,
@@ -211,6 +246,8 @@ class GeminiLanguageStream implements LanguageStream {
     glossary: string[],
     private handlers: StreamHandlers,
   ) {
+    this.padMinMs = config.geminiSilencePadMs;
+    this.padMaxMs = Math.max(config.geminiSilencePadMs, config.geminiSilencePadMaxMs);
     const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(config.geminiKey)}`;
     const socket = new WebSocket(url);
     this.socket = socket;
@@ -222,14 +259,49 @@ class GeminiLanguageStream implements LanguageStream {
       if (!this.closed) this.handlers.onError(error);
     });
     socket.on("close", (code, reason) => {
+      this.stopPadding();
       if (!this.closed) this.handlers.onError(new Error(`Gemini ${this.lang} socket closed (${code}${reason.length ? `: ${reason.toString().slice(0, 200)}` : ""})`));
     });
+    if (this.padMinMs > 0) {
+      this.padTimer = setInterval(() => this.padTick(), SILENCE_FRAME_MS);
+      this.padTimer.unref?.();
+    }
   }
 
   writePcm(pcm: Buffer): void {
     if (this.closed) return;
     this.inputBytes += pcm.length;
+    this.lastRealAt = Date.now();
+    this.lastPadAt = 0;
     this.sendAudio(pcm);
+  }
+
+  private padTick(): void {
+    if (this.closed || !this.ready) return;
+    const now = Date.now();
+    const pad = shouldPadSilence({
+      now,
+      lastRealAt: this.lastRealAt,
+      lastVoiceOutAt: this.lastVoiceOutAt,
+      minMs: this.padMinMs,
+      maxMs: this.padMaxMs,
+    });
+    if (!pad) {
+      if (this.endPending && now - this.lastRealAt > SILENCE_FRAME_MS * 2) this.sendStreamEnd();
+      return;
+    }
+    // Send exactly the wall time that passed, so Gemini sees a real-time clock.
+    const from = this.lastPadAt || this.lastRealAt;
+    const ms = Math.min(500, Math.max(SILENCE_FRAME_MS, now - from));
+    this.lastPadAt = now;
+    const bytes = Math.round((ms / 1000) * 16000) * 2;
+    this.padBytes += bytes;
+    this.sendAudio(Buffer.alloc(bytes));
+  }
+
+  private stopPadding(): void {
+    if (this.padTimer) clearInterval(this.padTimer);
+    this.padTimer = null;
   }
 
   private sendAudio(pcm: Buffer): void {
@@ -242,8 +314,9 @@ class GeminiLanguageStream implements LanguageStream {
 
   endUtterance(): void {
     if (this.closed || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    const seconds = this.inputBytes / 2 / 16000;
+    const seconds = (this.inputBytes + this.padBytes) / 2 / 16000;
     this.inputBytes = 0;
+    this.padBytes = 0;
     if (seconds > 0) {
       this.handlers.onUsage({
         provider: "gemini",
@@ -254,14 +327,41 @@ class GeminiLanguageStream implements LanguageStream {
         charactersIn: 0,
         charactersOut: 0,
         estimatedUsd: geminiLiveUsd(seconds, 0),
-        note: "Published per-second rate. Live sessions can also re-bill context, which this estimate leaves out.",
+        note: "Published per-second rate, including the silence we stream after each sentence. Live sessions can also re-bill context, which this estimate leaves out.",
       });
     }
+    if (this.padTimer) {
+      // Tell Gemini the stream ended only once the silence padding has finished.
+      this.endPending = true;
+      return;
+    }
+    this.sendStreamEnd();
+  }
+
+  private sendStreamEnd(): void {
+    this.endPending = false;
+    if (this.padBytes > 0) {
+      const seconds = this.padBytes / 2 / 16000;
+      this.padBytes = 0;
+      this.handlers.onUsage({
+        provider: "gemini",
+        kind: "live",
+        language: this.lang,
+        audioInputSeconds: seconds,
+        audioOutputSeconds: 0,
+        charactersIn: 0,
+        charactersOut: 0,
+        estimatedUsd: geminiLiveUsd(seconds, 0),
+        note: "Silence streamed after speech so the translation can finish.",
+      });
+    }
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
     this.socket.send(JSON.stringify(buildGeminiAudioStreamEnd()));
   }
 
   close(): void {
     this.closed = true;
+    this.stopPadding();
     this.socket?.close();
     this.socket = null;
   }
@@ -305,6 +405,7 @@ class GeminiLanguageStream implements LanguageStream {
         continue;
       }
       this.speaking = true;
+      this.lastVoiceOutAt = Date.now();
       const seconds = bytes.length / 2 / 24000;
       this.handlers.onAudio({ bytes, mime: "audio/pcm", sampleRate: 24000 });
       this.handlers.onUsage({

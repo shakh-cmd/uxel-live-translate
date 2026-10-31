@@ -253,7 +253,27 @@ function bindSocket(ws: WebSocket, req: http.IncomingMessage, store: SessionStor
       sendJson(ws, { type: "error", message: text });
     });
   });
+  // Browsers never send pings. Ping from here so proxies keep idle guest sockets open
+  // and dead ones are noticed.
+  let alive = true;
+  ws.on("pong", () => {
+    alive = true;
+  });
+  const pinger = setInterval(() => {
+    if (!alive) {
+      ws.terminate();
+      return;
+    }
+    alive = false;
+    try {
+      ws.ping();
+    } catch {
+      /* closed */
+    }
+  }, 25_000);
+  pinger.unref?.();
   ws.on("close", (closeCode) => {
+    clearInterval(pinger);
     clearTimeout(timer);
     if (authed) session.detach(ws, closeCode);
   });

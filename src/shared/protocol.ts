@@ -168,6 +168,8 @@ export type ServerMessage =
       audio?: string;
     }
   | { type: "pipelines"; languages: string[] }
+  /** Guide only: which languages are speaking right now, and who is asking a question. */
+  | { type: "activity"; speaking: string[]; asking: string[] }
   | { type: "metrics"; snapshot: MetricsSnapshot }
   | { type: "pong"; t: number }
   | { type: "error"; message: string };

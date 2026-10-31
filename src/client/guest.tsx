@@ -3,7 +3,7 @@ import type { LanguageOffer, PublicStop, ServerMessage, StopSummary } from "../s
 import { Brand, Footer } from "./brand";
 import { Button } from "./components/ui/button";
 import { Card, CardTitle } from "./components/ui/card";
-import { base64ToBytes, blobFrom, clientId, iosDevice, pcmToWavBlob } from "./lib";
+import { base64ToBytes, blobFrom, clientId, iosDevice } from "./lib";
 import { MicCapture } from "./mic";
 import { TourPlayer } from "./player";
 import { connectTour, type LiveSocket } from "./socket";
@@ -90,8 +90,8 @@ export function GuestPage({ code }: { code: string }) {
     } else if (message.type === "audio") {
       playerRef.current?.markReceived(message.utteranceId);
       const bytes = base64ToBytes(message.data);
-      const blob = message.mime === "audio/pcm" ? pcmToWavBlob(bytes, message.sampleRate || 24000) : blobFrom(bytes, "audio/wav");
-      playerRef.current?.enqueue(blob, message.utteranceId);
+      if (message.mime === "audio/pcm") playerRef.current?.enqueuePcm(bytes, message.sampleRate || 24000, message.utteranceId);
+      else playerRef.current?.enqueue(blobFrom(bytes, "audio/wav"), message.utteranceId);
     } else if (message.type === "play-stop") {
       setCaption(message.caption);
       void playUrl(message.audioUrl, message.stopId);

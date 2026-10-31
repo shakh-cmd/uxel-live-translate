@@ -10,6 +10,8 @@ import { log } from "./log";
 import { SessionMetrics } from "./metrics";
 import { languageOffers, type TranslationProvider } from "./providers";
 
+const MAX_BUFFERED_AUDIO_BYTES = 256 * 1024;
+
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 export function makeCode(length = 6): string {
@@ -49,6 +51,11 @@ export class TourSession {
   private sockets = new Map<WebSocket, { role: "guide" | "guest"; id: string }>();
   private stops = new Map<string, Stop>();
   private timer: NodeJS.Timeout;
+  private lastStatusLog = "";
+  private lastStatusLogAt = 0;
+  private lastPlayStop = { id: "", at: 0 };
+  private droppedAudio = 0;
+  lastActivityAt = Date.now();
   closed = false;
 
   constructor(
@@ -72,7 +79,7 @@ export class TourSession {
         this.pushStatus();
       },
     });
-    this.timer = setInterval(() => this.logStatus(), 10_000);
+    this.timer = setInterval(() => this.logStatus(true), 10_000);
     this.timer.unref?.();
   }
 
@@ -118,6 +125,7 @@ export class TourSession {
     const who = this.sockets.get(ws);
     this.sockets.delete(ws);
     if (!who) return;
+    this.lastActivityAt = Date.now();
     if (who.role === "guide") {
       if (this.guide === ws) {
         this.guide = null;
@@ -139,9 +147,16 @@ export class TourSession {
     log("guest-disconnected", { code: this.code, closeCode, guests: this.guests.size });
   }
 
+  /** True when nobody has been connected for `minutes`. Used to end forgotten tours. */
+  isIdle(minutes: number, now = Date.now()): boolean {
+    if (this.guide || this.guests.size > 0) return false;
+    return now - this.lastActivityAt > minutes * 60_000;
+  }
+
   async onMessage(ws: WebSocket, message: ClientMessage): Promise<void> {
     const who = this.sockets.get(ws);
     if (!who) return;
+    this.lastActivityAt = Date.now();
     if (who.role === "guide") await this.onGuide(message);
     else await this.onGuest(who.id, message);
   }
@@ -162,12 +177,18 @@ export class TourSession {
           await writeFile(path.join(dir, `${lang.code}.wav`), audio.bytes);
         }
       } catch (error) {
-        stop.renders.set(lang.code, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        const message = error instanceof Error ? error.message : String(error);
+        stop.renders.set(lang.code, { ok: false, error: message });
+        log("stop-render-error", { code: this.code, language: lang.code, message: message.slice(0, 300) });
       }
     });
     this.stops.set(stop.id, stop);
     const summary = this.stopSummary(stop, true);
     this.sendGuide({ type: "stops", stops: this.stopSummaries(true) });
+    if (!summary.languages.some((l) => l.ok)) {
+      const first = summary.languages.find((l) => !l.ok && l.error && l.error !== "not rendered");
+      this.sendGuide({ type: "error", message: `"${stop.name}" has no audio yet: ${first?.error || "no language could be prepared"}` });
+    }
     for (const guest of this.guests.values()) this.send(guest.ws, { type: "stops", stops: this.stopSummaries(false) });
     log("stop-ready", { code: this.code, name: stop.name, languages: summary.languages.filter((l) => l.ok).length });
     return summary;
@@ -283,6 +304,14 @@ export class TourSession {
       this.sendGuide({ type: "error", message: "That stop is not on this tour." });
       return;
     }
+    const now = Date.now();
+    // A double tap used to start the same recording twice on every phone.
+    if (this.lastPlayStop.id === stopId && now - this.lastPlayStop.at < 5000) return;
+    this.lastPlayStop = { id: stopId, at: now };
+    if (![...stop.renders.values()].some((render) => render.ok)) {
+      this.sendGuide({ type: "error", message: `"${stop.name}" has no saved audio. Prepare it again.` });
+      return;
+    }
     for (const guest of this.guests.values()) {
       if (!guest.language) continue;
       const render = stop.renders.get(guest.language);
@@ -345,7 +374,8 @@ export class TourSession {
     };
   }
 
-  private logStatus(): void {
+  private logStatus(periodic = false): void {
+    if (periodic && !this.guide && this.guests.size === 0) return;
     const entry = this.metrics.logStatus({
       guestCount: this.guests.size,
       broadcasting: this.broadcasting,
@@ -353,7 +383,14 @@ export class TourSession {
       rttMs: this.metrics.lastRttMs,
       signal: this.metrics.lastSignal,
     });
-    log("guide-status", { code: this.code, ...entry });
+    const key = JSON.stringify({ ...entry, at: undefined, rttMs: undefined });
+    const now = Date.now();
+    // Log on change, or once a minute, instead of every 10 s forever.
+    if (key !== this.lastStatusLog || now - this.lastStatusLogAt > 60_000) {
+      this.lastStatusLog = key;
+      this.lastStatusLogAt = now;
+      log("guide-status", { code: this.code, ...entry, droppedAudio: this.droppedAudio || undefined });
+    }
     this.sendGuide({ type: "metrics", snapshot: this.metrics.snapshot() });
   }
 
@@ -376,17 +413,45 @@ export class TourSession {
 
   private send(ws: WebSocket | null, message: ServerMessage): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // A phone on a weak link cannot take audio as fast as it is made. Drop live audio
+    // for that phone rather than queueing it, which only adds delay it can never win back.
+    if (message.type === "audio" && ws.bufferedAmount > MAX_BUFFERED_AUDIO_BYTES) {
+      this.droppedAudio += 1;
+      return;
+    }
     ws.send(JSON.stringify(message));
   }
 }
 
 export class SessionStore {
   private sessions = new Map<string, TourSession>();
+  private sweeper: NodeJS.Timeout;
 
   constructor(
     private config: Config,
     private provider: TranslationProvider,
-  ) {}
+  ) {
+    this.sweeper = setInterval(() => this.sweep(), 60_000);
+    this.sweeper.unref?.();
+  }
+
+  /** End tours nobody has been connected to for a while (they used to log forever). */
+  sweep(now = Date.now()): string[] {
+    const ended: string[] = [];
+    const minutes = this.config.idleSessionMinutes;
+    if (!minutes) return ended;
+    for (const session of [...this.sessions.values()]) {
+      if (!session.isIdle(minutes, now)) continue;
+      log("session-idle", { code: session.code, minutes });
+      this.end(session.code);
+      ended.push(session.code);
+    }
+    return ended;
+  }
+
+  size(): number {
+    return this.sessions.size;
+  }
 
   create(joinBase: string): TourSession {
     let code = makeCode();

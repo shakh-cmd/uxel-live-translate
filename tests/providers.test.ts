@@ -61,7 +61,7 @@ test("Gemini Live Translate setup matches the published websocket shape", () => 
     realtimeInput: { audio: { data: "AAAA", mimeType: "audio/pcm;rate=16000" } },
   });
   assert.deepEqual(buildGeminiAudioStreamEnd(), { realtimeInput: { audioStreamEnd: true } });
-  assert.equal(geminiGenerateUrl("gemini-2.5-flash"), "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent");
+  assert.equal(geminiGenerateUrl("gemini-3.5-flash-lite"), "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent");
   assert.equal(buildGeminiTextBody("Hello").contents[0].parts[0].text, "Hello");
 });
 

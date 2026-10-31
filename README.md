@@ -67,7 +67,7 @@ Checked against the provider docs on 31 Oct 2026:
 - **Gemini Live Translate:** the websocket setup matches the current Live Translate guide (model `gemini-3.5-live-translate-preview`, 16 kHz PCM in, 24 kHz PCM out, `translationConfig.targetLanguageCode`). **Not tried with a real key.** No `GEMINI_API_KEY` was available.
 - **OpenAI modular path:** the three HTTP calls match the current docs (file transcription, chat completions, speech as wav). **Not tried with a real key.** No `OPENAI_API_KEY` was available.
 
-Live Translate does not accept typed text. Scripted stops are translated with `gemini-2.5-flash` when Gemini is selected, and the spoken file for that stop is made locally with `espeak-ng`. The live voice during the tour still comes from Gemini.
+Live Translate does not accept typed text. Scripted stops are translated with `gemini-3.5-flash-lite` (set `GEMINI_TEXT_MODEL` to change it; `gemini-2.5-flash` now returns 404 for new keys) when Gemini is selected, and the spoken file for that stop is made locally with `espeak-ng`. The live voice during the tour still comes from Gemini.
 
 ## Place names
 

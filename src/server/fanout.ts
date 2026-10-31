@@ -1,4 +1,5 @@
 import type { LatencySample, ServerMessage, UsageEvent } from "../shared/protocol";
+import { log } from "./log";
 import type { LanguageStream, TranslationProvider, UsageDraft } from "./providers/types";
 
 type LatencyDraft = Omit<LatencySample, "at">;
@@ -21,6 +22,10 @@ export class LanguageFanout {
   private firstAudioAt = new Set<string>();
   private earlyEmitted = new Set<string>();
   private seq = new Map<string, number>();
+  private speakingUntil = new Map<string, number>();
+  private asking = new Set<string>();
+  private activityKey = "";
+  private activityTimer: NodeJS.Timeout | null = null;
 
   constructor(
     readonly provider: TranslationProvider,
@@ -88,29 +93,45 @@ export class LanguageFanout {
   }
 
   async handleQuestion(guestId: string, language: string, pcm: Buffer, hint?: string): Promise<void> {
-    let original = hint?.trim() || "";
-    if (!original) {
-      const heard = await this.provider.transcribe(pcm, { glossary: this.glossary, language, hint });
-      if (heard.usage) this.sinks.onUsage(heard.usage);
-      original = heard.text.trim();
+    const started = Date.now();
+    this.asking.add(guestId);
+    this.emitActivity();
+    try {
+      let original = hint?.trim() || "";
+      if (!original) {
+        const heard = await this.provider.transcribe(pcm, { glossary: this.glossary, language, hint });
+        if (heard.usage) this.sinks.onUsage(heard.usage);
+        original = heard.text.trim();
+      }
+      if (!original) original = "(question audio received)";
+      const english = await this.provider.translateToEnglish(original, language, this.glossary);
+      if (english.usage) this.sinks.onUsage(english.usage);
+      const audio = await this.provider.synthesize(english.text, "en");
+      if (audio.usage) this.sinks.onUsage(audio.usage);
+      this.sinks.toGuide({
+        type: "question",
+        guestId,
+        language,
+        original,
+        english: english.text,
+        mime: "audio/wav",
+        audio: audio.bytes.toString("base64"),
+      });
+      log("question", { language, ms: Date.now() - started, chars: english.text.length });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log("question-error", { language, message: message.slice(0, 300) });
+      // Before, only the guest saw this, so the guide never knew a question was lost.
+      this.sinks.toGuide({ type: "error", message: `A ${language} guest question could not be translated: ${message}` });
+      this.sinks.toGuest(guestId, { type: "error", message: "Your question could not be sent. Please try again." });
+    } finally {
+      this.asking.delete(guestId);
+      this.emitActivity();
     }
-    if (!original) original = "(question audio received)";
-    const english = await this.provider.translateToEnglish(original, language, this.glossary);
-    if (english.usage) this.sinks.onUsage(english.usage);
-    const audio = await this.provider.synthesize(english.text, "en");
-    if (audio.usage) this.sinks.onUsage(audio.usage);
-    this.sinks.toGuide({
-      type: "question",
-      guestId,
-      language,
-      original,
-      english: english.text,
-      mime: "audio/wav",
-      audio: audio.bytes.toString("base64"),
-    });
   }
 
   close(): void {
+    if (this.activityTimer) clearTimeout(this.activityTimer);
     for (const stream of this.streams.values()) stream.close();
     this.streams.clear();
   }
@@ -185,6 +206,7 @@ export class LanguageFanout {
     const stream = this.provider.openLanguageStream(language, {
       onAudio: (chunk) => {
         this.failures.set(language, 0);
+        this.noteSpeaking(language, chunk.bytes.length / 2 / (chunk.sampleRate || 24000));
         const ids = [...this.guests.entries()].filter(([, lang]) => lang === language).map(([id]) => id);
         this.sendAudio(language, ids, this.currentUtterance || "live", chunk.bytes, chunk.mime, chunk.sampleRate, Boolean(chunk.end));
       },
@@ -215,6 +237,7 @@ export class LanguageFanout {
       onUsage: (usage) => this.sinks.onUsage(usage),
       onError: (error) => {
         const count = (this.failures.get(language) ?? 0) + 1;
+        log("translation-error", { language, count, message: error.message.slice(0, 300) });
         this.failures.set(language, count);
         this.streams.get(language)?.close();
         this.streams.delete(language);
@@ -226,12 +249,40 @@ export class LanguageFanout {
       },
     }, { glossary: this.glossary });
     this.streams.set(language, stream);
+    log("translation-open", { language, provider: this.provider.id });
+  }
+
+  private noteSpeaking(language: string, seconds: number): void {
+    const now = Date.now();
+    const until = Math.max(this.speakingUntil.get(language) ?? 0, now) + seconds * 1000;
+    this.speakingUntil.set(language, until);
+    this.emitActivity();
+  }
+
+  /** Tell the guide which languages are speaking. Sent only when the set changes. */
+  private emitActivity(): void {
+    const now = Date.now();
+    const speaking = [...this.speakingUntil.entries()].filter(([, until]) => until > now - 300).map(([lang]) => lang).sort();
+    const asking = [...this.asking].sort();
+    const key = `${speaking.join(",")}|${asking.join(",")}`;
+    if (this.activityTimer) clearTimeout(this.activityTimer);
+    this.activityTimer = null;
+    if (speaking.length) {
+      const next = Math.min(...speaking.map((lang) => this.speakingUntil.get(lang) ?? now)) - now + 350;
+      this.activityTimer = setTimeout(() => this.emitActivity(), Math.max(200, next));
+      this.activityTimer.unref?.();
+    }
+    if (key === this.activityKey) return;
+    this.activityKey = key;
+    this.sinks.toGuide({ type: "activity", speaking, asking });
   }
 
   private release(language: string): void {
     if (this.listeners(language) > 0) return;
     this.streams.get(language)?.close();
     this.streams.delete(language);
+    this.speakingUntil.delete(language);
+    log("translation-close", { language });
   }
 
   private listeners(language: string): number {

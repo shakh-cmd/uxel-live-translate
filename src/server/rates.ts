@@ -1,5 +1,5 @@
 /**
- * Published prices checked 31 Oct 2026. These feed a session estimate, not an invoice.
+ * Published prices checked 31 Oct 2026 (gemini-3.5-flash-lite: $0.30 in / $2.50 out per 1M tokens, audio 25 tokens/s). These feed a session estimate, not an invoice.
  * Gemini Live may re-bill accumulated context each turn, so a real invoice can be higher
  * than the per-second audio rate used here.
  * Sources:
@@ -14,7 +14,7 @@ export const RATES = {
     outputUsdPerMillion: 21,
   },
   geminiText: {
-    model: "gemini-2.5-flash",
+    model: "gemini-3.5-flash-lite",
     inputUsdPerMillion: 0.3,
     outputUsdPerMillion: 2.5,
   },

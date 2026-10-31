@@ -23,11 +23,20 @@ export type Config = {
   openaiTtsVoice: string;
   geminiLiveModel: string;
   geminiTextModel: string;
+  geminiSilencePadMs: number;
+  geminiSilencePadMaxMs: number;
+  idleSessionMinutes: number;
 };
 
 function bool(value: string | undefined, fallback: boolean): boolean {
   if (value == null || value === "") return fallback;
   return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+}
+
+function num(value: string | undefined, fallback: number): number {
+  if (value == null || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -52,6 +61,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     openaiTtsModel: env.OPENAI_TTS_MODEL || "tts-1",
     openaiTtsVoice: env.OPENAI_TTS_VOICE || "nova",
     geminiLiveModel: env.GEMINI_LIVE_MODEL || "gemini-3.5-live-translate-preview",
-    geminiTextModel: env.GEMINI_TEXT_MODEL || "gemini-2.5-flash",
+    // gemini-2.5-flash now returns 404 for new API keys, which broke questions and stops.
+    geminiTextModel: env.GEMINI_TEXT_MODEL || "gemini-3.5-flash-lite",
+    geminiSilencePadMs: num(env.GEMINI_SILENCE_PAD_MS, 4000),
+    geminiSilencePadMaxMs: num(env.GEMINI_SILENCE_PAD_MAX_MS, 30000),
+    idleSessionMinutes: num(env.IDLE_SESSION_MINUTES, 30),
   };
 }

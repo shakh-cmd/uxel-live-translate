@@ -7,12 +7,17 @@ import android.media.MediaRecorder
 import java.util.UUID
 
 /**
- * 16 kHz mono PCM with a simple energy VAD. Silence is not forwarded.
+ * 16 kHz mono PCM with a simple energy VAD.
+ * Long silences are not forwarded (the server keeps Gemini's clock moving with padding),
+ * but quiet frames inside speech are, so words are not glued together.
+ * 150 ms before speech starts is sent too, so the first syllable is not clipped.
  * The end-of-speech frame is empty and marked end=true, matching the web guide.
+ * While [muted] is true (a guest question is playing on the guide's speaker) nothing is sent.
  */
 class MicCapture(
     private val device: () -> AudioDeviceInfo?,
     private val running: () -> Boolean,
+    private val muted: () -> Boolean = { false },
     private val onFrame: (pcm: ByteArray, utteranceId: String, seq: Int, end: Boolean) -> Unit,
 ) {
     fun loop() {
@@ -23,6 +28,7 @@ class MicCapture(
         var seq = 0
         var openId = Int.MIN_VALUE
         val buffer = ByteArray(1600)
+        val preroll = ArrayDeque<ByteArray>()
         try {
             while (running()) {
                 val preferred = device()
@@ -36,24 +42,44 @@ class MicCapture(
                 }
                 val read = recorder.read(buffer, 0, buffer.size)
                 if (read <= 0) continue
+                if (muted()) {
+                    preroll.clear()
+                    if (speaking) {
+                        speaking = false
+                        silenceMs = 0
+                        seq += 1
+                        onFrame(ByteArray(0), utteranceId, seq, true)
+                    }
+                    continue
+                }
+                val frame = buffer.copyOf(read)
                 val hot = rms(buffer, read) >= 0.02
                 if (hot) {
                     if (!speaking) {
                         speaking = true
                         utteranceId = UUID.randomUUID().toString()
                         seq = 0
+                        while (preroll.isNotEmpty()) {
+                            seq += 1
+                            onFrame(preroll.removeFirst(), utteranceId, seq, false)
+                        }
                     }
                     silenceMs = 0
                     seq += 1
-                    onFrame(buffer.copyOf(read), utteranceId, seq, false)
+                    onFrame(frame, utteranceId, seq, false)
                 } else if (speaking) {
                     silenceMs += 50
+                    seq += 1
                     if (silenceMs >= 700) {
                         speaking = false
                         silenceMs = 0
-                        seq += 1
                         onFrame(ByteArray(0), utteranceId, seq, true)
+                    } else {
+                        onFrame(frame, utteranceId, seq, false)
                     }
+                } else {
+                    preroll.addLast(frame)
+                    while (preroll.size > 3) preroll.removeFirst()
                 }
             }
         } finally {
